@@ -1,0 +1,1 @@
+#define NV_PCI_DOMAIN_NR_PRESENT

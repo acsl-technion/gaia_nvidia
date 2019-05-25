@@ -1,0 +1,1 @@
+#define NV_SG_TABLE_PRESENT

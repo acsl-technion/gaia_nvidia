@@ -1,0 +1,1 @@
+#undef NV_PROC_DIR_ENTRY_HAS_OWNER

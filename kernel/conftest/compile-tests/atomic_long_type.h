@@ -1,0 +1,1 @@
+#undef NV_ATOMIC_LONG_PRESENT

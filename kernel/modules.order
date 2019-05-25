@@ -1,0 +1,4 @@
+kernel//home/user/Downloads/NVIDIA-Linux-x86_64-384.59/kernel/nvidia.ko
+kernel//home/user/Downloads/NVIDIA-Linux-x86_64-384.59/kernel/nvidia-uvm.ko
+kernel//home/user/Downloads/NVIDIA-Linux-x86_64-384.59/kernel/nvidia-modeset.ko
+kernel//home/user/Downloads/NVIDIA-Linux-x86_64-384.59/kernel/nvidia-drm.ko

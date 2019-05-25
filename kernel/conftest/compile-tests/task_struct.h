@@ -1,0 +1,1 @@
+#define NV_TASK_STRUCT_HAS_CRED

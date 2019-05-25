@@ -1,0 +1,1 @@
+#define NV_OF_NODE_TO_NID_PRESENT

@@ -1,0 +1,1 @@
+#define NV_FAULT_FLAG_PRESENT

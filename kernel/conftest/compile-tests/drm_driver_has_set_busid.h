@@ -1,0 +1,1 @@
+#define NV_DRM_DRIVER_HAS_SET_BUSID

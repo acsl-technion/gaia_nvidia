@@ -1,0 +1,1 @@
+#define NV_OF_GET_PROPERTY_PRESENT
