@@ -35,6 +35,8 @@
 #include "uvm8_init.h"
 #include "uvm8_forward_decl.h"
 
+#include <linux/debugfs.h>
+
 // TODO: Bug 1710855: Tweak this number through benchmarks
 #define UVM_SPIN_LOOP_SCHEDULE_TIMEOUT_NS   (10*1000ULL)
 #define UVM_SPIN_LOOP_PRINT_TIMEOUT_SEC     30ULL
@@ -115,6 +117,78 @@ NV_STATUS uvm_api_unsupported(void *pParams, struct file *filp)
     return NV_ERR_NOT_SUPPORTED;
 }
 
+
+long int pf_counter;
+struct dentry *root, *pfcnt;
+int filevalue;
+static ssize_t pf_counter_write(struct file *fp, const char __user *user_buffer,
+			size_t count, loff_t *position)
+{
+	pf_counter = 0;
+	UCM_DBG("Reset pf_counter\n");
+	return count;
+}
+
+
+static ssize_t pf_counter_read(struct file *fp, char __user *user_buffer,
+				size_t count, loff_t *position)
+{
+	char buf[64] = {'\0'};
+	snprintf(buf, sizeof(buf), "#of,4KB,pages,copied,to,gpu,is,%ld,=,%ld,gpu_pages\n", pf_counter,pf_counter/16);
+	return simple_read_from_buffer(user_buffer, count, position,
+			buf, sizeof(buf));
+}
+
+static int debugfs_open(struct inode *inode, struct file *file)
+{
+	file->private_data = inode->i_private;
+	return 0;
+}
+
+static const struct file_operations pf_counter_fops = {
+	.open		= debugfs_open,
+	.read		= pf_counter_read,
+	.write		= pf_counter_write,
+};
+
+
+int create_dbgfs(void)
+{
+	 int ret = -1;
+	 pf_counter = 0;
+	root = debugfs_create_dir("uvm_dbg", NULL);
+	if (IS_ERR(root)) {
+		UCM_ERR("Can't create debugfs\n");
+		return -1;
+	}
+	if (!root)
+	/* Complain -- debugfs is enabled, but it failed to
+		 * create the directory. */
+	goto err_root;
+
+	/* create a file in the above directory
+	 * This requires read and write file operations */
+	pfcnt = debugfs_create_file("pf_counter", 0644, root, &filevalue, &pf_counter_fops);
+	if (!pfcnt) {
+		UCM_ERR("error creating pfcnt file\n");
+		goto err_files;
+	}
+
+	UCM_ERR("created debugfs\n");
+	return 0;
+
+err_files:
+	debugfs_remove_recursive(root);
+err_root:
+	UCM_ERR("failed to initialize debugfs\n");
+	return ret;
+}
+
+void clean_dbgfs(void)
+{
+	debugfs_remove_recursive(root);
+}
+
 //
 // TODO: Bug 1766109: uvm8: delete UVM-Lite files and remove -lite mode
 //  ...just remove -lite mode, instead of the original to-do: which was:
@@ -148,7 +222,7 @@ static int __init uvm_init(void)
     if (uvm_enable_builtin_tests)
         pr_info("Built-in UVM tests are enabled. This is a security risk.\n");
 
-    return 0;
+    return create_dbgfs();
 
 error:
     if (allocated_dev)
@@ -162,7 +236,7 @@ static void __exit uvm_exit(void)
     uvm8_exit();
 
     unregister_chrdev_region(g_uvmBaseDev, NVIDIA_UVM_NUM_MINOR_DEVICES);
-
+    clean_dbgfs();
     pr_info("Unloaded the UVM driver in %s mode\n", uvm_driver_mode_to_string(uvm_get_mode()));
 }
 
@@ -388,5 +462,5 @@ module_param(uvm_enable_builtin_tests, int, S_IRUGO);
 MODULE_PARM_DESC(uvm_enable_builtin_tests,
                  "Enable the UVM built-in tests. (This is a security risk)");
 
-MODULE_LICENSE("MIT");
+MODULE_LICENSE("GPL");
 MODULE_INFO(supported, "external");

@@ -819,7 +819,17 @@ static NV_STATUS preprocess_fault_batch(uvm_gpu_t *gpu, uvm_fault_service_batch_
          sizeof(*ordered_fault_cache),
          cmp_sort_fault_entry_by_va_space_address_access_type,
          NULL);
-
+#if 0
+UCM_DBG("\n\n GOT %d cached faults:\n", batch_context->num_cached_faults);
+if (batch_context->num_cached_faults == UVM_PERF_FAULT_BATCH_COUNT_DEFAULT) {
+	NvU64 addr_prev = 0;
+	for (i = 0; i < batch_context->num_cached_faults; ++i) {
+		NvU64 addr = ordered_fault_cache[i]->fault_address;
+		if (addr != addr_prev) {pr_err("(%d) 0x%llx,  ",i, addr); addr_prev = addr;}
+	}
+	UCM_DBG("\n\n");
+}
+#endif
     return NV_OK;
 }
 

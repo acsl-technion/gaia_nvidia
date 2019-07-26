@@ -36,6 +36,9 @@
 #include "uvm8_perf_prefetch.h"
 #include "uvm8_mem.h"
 
+#include <linux/ucm.h>
+#include <linux/pagemap.h>
+
 typedef enum
 {
     BLOCK_PTE_OP_MAP,
@@ -488,6 +491,28 @@ uvm_gpu_chunk_t *uvm_va_block_lookup_gpu_chunk(uvm_va_block_t *va_block, uvm_gpu
     return gpu_state->chunks[chunk_index];
 }
 
+//Return the corresponding virtual addr of the cpu vma
+struct uvm_va_mappings_struct *uvm_get_cpu_mapping( uvm_va_space_t *va_space, NvU64 start, NvU64 end){
+//    uvm_va_space_t *va_space = block->va_range->va_space;
+   // struct vm_area_struct *uvm_vma = block->va_range->managed.vma_wrapper->vma;
+    //NvU64 shared_addr = block->start + page_index * PAGE_SIZE;
+//    NvU64 cpu_addr = 0;
+    struct uvm_va_mappings_struct *map;
+    int i;
+//    gfp_t gfp_flags = NV_UVM_GFP_FLAGS | GFP_HIGHUSER;
+
+        for (i = 0; i < va_space->mmap_arr_idx; i++) {
+                map = &va_space->mmap_array[i];
+                if ((map->start < start || map->start == start ) && (map->end > start)) {
+                        //cpu_addr = map->cpu_vma->vm_start + (start - map->uvm_vma->vm_start);
+//UCM_DBG("found mapping for block[0x%llx-0x%llx] . \n",start, end);
+                        return map;
+                }
+        }
+//UCM_DBG("Didnt find mapping for block[0x%llx-0x%llx] va_space=0x%llx \n",start, end, va_space);
+    return NULL;
+}
+
 NV_STATUS uvm_va_block_create(uvm_va_range_t *va_range,
                               NvU64 start,
                               NvU64 end,
@@ -519,6 +544,10 @@ NV_STATUS uvm_va_block_create(uvm_va_range_t *va_range,
     uvm_mutex_init(&block->lock, UVM_LOCK_ORDER_VA_BLOCK);
     block->start = start;
     block->end = end;
+
+    block->cpu_map = uvm_get_cpu_mapping(get_shared_mem_va_space(), start, end); 
+
+ WARN_ON(!va_range);
     block->va_range = va_range;
     uvm_tracker_init(&block->tracker);
 
@@ -531,6 +560,13 @@ NV_STATUS uvm_va_block_create(uvm_va_range_t *va_range,
         status = NV_ERR_NO_MEMORY;
         goto error;
     }
+
+    block->cpu.page_from_cache =  kzalloc((size / PAGE_SIZE) * sizeof(block->cpu.page_from_cache[0]), GFP_KERNEL);
+    if (block->cpu.page_from_cache == NULL)
+    	return -ENOMEM;
+    block->cpu.pages_diff = kzalloc((size / PAGE_SIZE) * sizeof(block->cpu.pages_diff[0]), GFP_KERNEL);
+    if (block->cpu.pages_diff == NULL)
+    	return -ENOMEM;
 
     *out_block = block;
     return NV_OK;
@@ -656,6 +692,187 @@ error:
     return status;
 }
 
+static bool uvm_populate_page_from_cache(uvm_va_block_t *block, pgoff_t page_index)
+{
+    struct page *page;
+    mm_segment_t oldfs;
+    int i, ret;
+    pgoff_t cpu_page_idx;
+    uvm_va_space_t *va_space = block->va_range->va_space;
+    struct vm_area_struct *uvm_vma = block->va_range->managed.vma_wrapper->vma;
+    NvU64 shared_addr = block->start + page_index * PAGE_SIZE;
+    NvU64 cpu_addr = 0;
+    struct uvm_va_mappings_struct *map = block->cpu_map;
+    int error = 0;
+    struct page *ucm_page = block->cpu.pages[page_index];
+    unsigned long fsize  = 0;
+    struct file_ra_state *ra;
+    int bkp;
+
+    if (!map) {
+UCM_ERR("Why did I enter this func?????\n");
+        return false;
+    }
+
+    if ((map->start < shared_addr || map->start == shared_addr ) && map->end > shared_addr) {
+	cpu_addr = map->cpu_vma->vm_start + (shared_addr - map->start);
+ /*UCM_DBG("found mapping for shared addr 0x%llx at idx %d. cpu addr= 0x%llx. cpu mmaped vma=%p\n", 
+				shared_addr, i, cpu_addr, map->cpu_vma);*/
+    }
+    if (!cpu_addr)
+    	return NULL;
+	//now get the page from disk according to cpu_addr. note that page_idx for cpu might differ!!!
+//UCM_ERR("Enter for pageindex = %d\n", page_index);
+
+    cpu_page_idx = ((cpu_addr - map->cpu_vma->vm_start)*1L) / (PAGE_SIZE*1L);
+    fsize = map->cpu_vma->vm_file->f_inode->i_size / (64*1024);
+    fsize = (fsize ? fsize : 1);
+    ra = &map->cpu_vma->vm_file->f_ra;
+find_page:
+//UCM_DBG("lokking for (uvm)page_index= %ld cpu_addr 0x%llx, shared_addr 0x%llx, cpu_page_idx %ld\n", page_index, cpu_addr, shared_addr, cpu_page_idx);
+    page = find_get_page(map->cpu_vma->vm_file->f_mapping, cpu_page_idx);
+    if (!page) {
+    	/* No page in the page cache at all */
+	bkp = ra->ra_pages;
+    	//ra->ra_pages = 512;
+	ra->ra_pages = 4196;
+    	//best for lud is to set to 4196
+    	do_sync_mmap_readahead(map->cpu_vma, ra, map->cpu_vma->vm_file, cpu_page_idx);
+	ra->ra_pages = bkp;
+		page = find_get_page(map->cpu_vma->vm_file->f_mapping, cpu_page_idx);
+		if (!page) {
+			error = page_cache_read(map->cpu_vma->vm_file, cpu_page_idx);
+			if (error < 0) {
+				UCM_ERR("page_cache_read failed with err = %d\n", error);
+				return false;
+			}
+//UCM_DBG("Scnheduled read to cache. should find it now\n");
+			goto find_page;
+		}
+		goto found_page;
+    } else {
+found_page:
+
+		//do_async_mmap_readahead(vma, ra, file, page, offset);
+		/* Did it get truncated? */
+		if (unlikely(page->mapping != map->cpu_vma->vm_file->f_mapping)) {
+			//UCM_DBG(" found page in cache but its truncated. release and look again\n");
+			unlock_page(page);
+			put_page(page);
+			goto find_page;
+		}
+		bkp = ra->ra_pages;
+		ra->ra_pages = 32;
+		do_async_mmap_readahead(map->cpu_vma, ra, map->cpu_vma->vm_file, page, cpu_page_idx);
+		ra->ra_pages = bkp;
+//		ra.start = cpu_page_idx + 16;
+//		ra.size = 64; //fsize is in gpu pages, ra.size is in cpupages
+//		ra.async_size = ra.size;
+
+//		page_cache_async_readahead_gpu(map->cpu_vma->vm_file->f_mapping,
+//				&ra, map->cpu_vma->vm_file,
+//					  page, cpu_page_idx, 16);
+
+		/*
+		 * We have a locked page in the page cache, now we need to check
+		 * that it's up-to-date. If not, it is going to be due to an error.
+		 */
+		if (unlikely(!PageUptodate(page))){
+			//UCM_DBG("Found the right page but its not uptpdate. reading from disk\n");
+			/*
+			 * Umm, take care of errors if the page isn't up-to-date.
+			 * Try to re-read it _once_. We do this synchronously,
+			 * because there really aren't any performance issues here
+			 * and we need to check for errors.
+			 */
+			ClearPageError(page);
+			error = map->cpu_vma->vm_file->f_mapping->a_ops->readpage(map->cpu_vma->vm_file, page);
+			if (!error) {
+				wait_on_page_locked(page);
+				if (!PageUptodate(page))
+					error = -EIO;
+			}
+			page_cache_release(page);
+
+			if (!error || error == AOP_TRUNCATED_PAGE)
+				goto find_page;
+			//If we got here an err occured
+			UCM_ERR("readign page failed..\n");
+			return false;
+		}
+    }
+ if (1) {
+    copy_user_highpage(ucm_page, page,//map to virtual addr in vma
+                shared_addr, uvm_vma);
+ } else {
+	 char *cpu_addr = (char *)kmap(page);
+	 char *gpu_addr = (char *)kmap(ucm_page);
+	 //UCM_DBG("memcpy from =0x%llx to 0x%llx page_idx=%ld\n", tmp_addr, block->cpu.pages_diff[page_index], page_index);
+	 memcpy(gpu_addr, cpu_addr, PAGE_SIZE);
+	 kunmap(ucm_page);
+	 kunmap(page);
+ }
+    /* Need to save a copy of the page for future diff in order to locate GPU changes */
+    {
+    	char *tmp_addr = (char *)kmap(page);
+//UCM_DBG("memcpy from =0x%llx to 0x%llx page_idx=%ld\n", tmp_addr, block->cpu.pages_diff[page_index], page_index);
+        memcpy(block->cpu.pages_diff[page_index], tmp_addr, PAGE_SIZE);
+        kunmap(page);
+    }
+
+	ClearPagedirty_GPU(page);
+	radix_tree_tag_clear(&page->mapping->page_tree,
+	        page->index, PAGECACHE_TAG_CPU_DIRTY);
+
+	ucm_page->mapping = page->mapping;
+	ucm_page->index = page->index;
+	if (!(page_index % 16)) {
+		struct ucm_page_data *pdata =  kzalloc(sizeof(struct ucm_page_data), GFP_KERNEL);
+		/* Try to aff ucm_page into page cache marking it ON_GPU */
+		pdata->shared_addr = shared_addr;
+		pdata->gpu_maped_vma = uvm_vma;
+		pdata->my_page = ucm_page;
+		INIT_LIST_HEAD(&pdata->lra);
+		ucm_page->private = (void *)pdata;
+//		UCM_DBG("Populated page addr=0x%llx [idx %lld gpu page=%d] from cache\n",shared_addr, ucm_page->index, ucm_page->index/16);
+	} else if (page_index % 16 == 15) {
+		struct page *tmp;
+		if (page_index - 15 < 0 || !block->cpu.pages[page_index - 15]) {
+			UCM_ERR("Cant add the forst page to cache!!! page_inex=%ld\n", page_index);
+			goto out;
+		}
+		if (!block->cpu.pages[page_index - 15]) {
+			UCM_ERR("the first page is missing!! page_inex=%ld\n", page_index);
+			goto out;
+		}
+		if ( !block->cpu.page_from_cache[page_index - 15]) {
+			UCM_ERR("the first page is not marked from cache!! page_inex=%ld\n", page_index);
+			goto out;
+		}
+//		UCM_DBG("will add to cache pageidx = %ld \n", page_index);
+		tmp = block->cpu.pages[page_index - 15];
+		__set_page_locked(tmp);
+		if (tmp->mapping != page->mapping || !tmp->private) {
+			UCM_ERR("first page was not properly initialized page_inex=%ld\n", page_index);
+			goto out;
+		}
+		SetPageonGPU(tmp);
+		ret = add_to_page_cache_gpu(tmp, tmp->mapping, tmp->index,
+							 mapping_gfp_mask(tmp->mapping), GPU_NVIDIA);
+		__clear_page_locked(tmp);
+		if (ret) {
+			UCM_ERR("Failed addeing page to cache\n");
+			__free_page(page);
+			return false;
+		}
+//		UCM_DBG("added page at idx %ld to cache marked onGPU \n", tmp->index);
+	}
+out:
+    put_page(page);
+    return true;
+}
+
+
 // Allocates the input page in the block, if it doesn't already exist
 //
 // Also maps the page for physical access by all GPUs used by the block, which
@@ -667,7 +884,7 @@ static NV_STATUS block_populate_page_cpu(uvm_va_block_t *block, size_t page_inde
     gfp_t gfp_flags;
 
     if (block->cpu.pages[page_index])
-        return NV_OK;
+    	return NV_OK;
 
     UVM_ASSERT(!test_bit(page_index, block->cpu.resident));
 
@@ -687,7 +904,12 @@ static NV_STATUS block_populate_page_cpu(uvm_va_block_t *block, size_t page_inde
     if (status != NV_OK)
         goto error;
 
+//UCM_DBG("allocated page at index %ld addr 0x%llx block->cpu_map=0x%llx\n",
+//		page_index, block->start + page_index*PAGE_SIZE,
+//		 block->cpu_map);
+
     block->cpu.pages[page_index] = page;
+
     return NV_OK;
 
 error:
@@ -1062,7 +1284,7 @@ static bool block_processor_page_is_populated(uvm_va_block_t *block, uvm_process
     return gpu_state->chunks[chunk_index] != NULL;
 }
 
-static bool block_processor_page_is_resident_on(uvm_va_block_t *block, uvm_processor_id_t proc, size_t page_index)
+bool block_processor_page_is_resident_on(uvm_va_block_t *block, uvm_processor_id_t proc, size_t page_index)
 {
     unsigned long *resident_mask;
 
@@ -1964,8 +2186,8 @@ static NV_STATUS block_copy_resident_pages_between(uvm_va_block_t *block,
         uvm_make_resident_cause_t page_cause = (may_prefetch && test_bit(page_index, prefetch_page_mask))?
                                                 UVM_MAKE_RESIDENT_CAUSE_PREFETCH:
                                                 cause;
-
         if (dst_id == UVM_CPU_ID) {
+//UCM_DBG("will copypage idx = %ld addr 0x%llx from GPU\n", page_index, block->start + page_index * PAGE_SIZE);
             // To support staging through CPU, populate CPU pages on demand.
             // GPU destinations should have their pages populated already, but
             // that might change if we add staging through GPUs.
@@ -1973,6 +2195,17 @@ static NV_STATUS block_copy_resident_pages_between(uvm_va_block_t *block,
             if (status != NV_OK)
                 break;
         }
+//UCM_DBG("Enter for page idx = %ld\n", page_index);
+        if (block->cpu_map && !block->cpu.page_from_cache[page_index]) {
+ 	/* Page is residnet in CPU but NOT populated from cache. Fill it in */
+//if( block->start + page_index * PAGE_SIZE > 0x3f99f0000)
+//UCM_DBG("Page idx %d (addr = 0x%llx) resident in CPU but mot populated from cache. \n",
+//page_index, block->start + page_index * PAGE_SIZE);
+               	if (uvm_populate_page_from_cache(block, page_index))
+                       	block->cpu.page_from_cache[page_index] = true;
+        } //else if (block->cpu.page_from_cache[page_index])
+       // 	UCM_DBG("Page at idx=%d already populated from cache (block start=0x%llx)\n", page_index, block->start);
+	//else UCM_ERR("!block cpu map???\n");
 
         UVM_ASSERT(block_processor_page_is_populated(block, dst_id, page_index));
 
@@ -2007,8 +2240,10 @@ static NV_STATUS block_copy_resident_pages_between(uvm_va_block_t *block,
         }
 
         // No need to copy pages that haven't changed.  Just clear residency information
-        if (block_page_is_clean(block, dst_id, src_id, page_index))
+        if (block_page_is_clean(block, dst_id, src_id, page_index)){
+UCM_DBG("page is clean so skipping copy\n");
             goto update_bits;
+        }
 
         if (!copying_gpu) {
             status = block_copy_begin_push(block, dst_id, src_id, &block->tracker, &push);
@@ -2060,6 +2295,7 @@ static NV_STATUS block_copy_resident_pages_between(uvm_va_block_t *block,
                 dst_address.address += contig_start_index * PAGE_SIZE;
 
                 uvm_push_set_flag(&push, UVM_PUSH_FLAG_CE_NEXT_MEMBAR_NONE);
+UCM_DBG("Contig copy to gpu of size = %lld\n", contig_region_size);
                 copying_gpu->ce_hal->memcopy(&push, dst_address, src_address, contig_region_size);
             }
 
@@ -2104,6 +2340,10 @@ static NV_STATUS block_copy_resident_pages_between(uvm_va_block_t *block,
             }
 
             uvm_push_set_flag(&push, UVM_PUSH_FLAG_CE_NEXT_MEMBAR_NONE);
+//if (dst_id != UVM_CPU_ID && !(page_index % 16))
+//UCM_DBG("will copypage idx = %ld (gpu page=%d) addr=0x%llx to gpu \n", page_index, page_index/16, block->start + page_index * PAGE_SIZE);
+            if (dst_id != UVM_CPU_ID)
+            	pf_counter++;
             copying_gpu->ce_hal->memcopy(&push, dst_address, src_address, PAGE_SIZE);
         }
 
@@ -2159,6 +2399,7 @@ update_bits:
             dst_address.address += contig_start_index * PAGE_SIZE;
 
             uvm_push_set_flag(&push, UVM_PUSH_FLAG_CE_NEXT_MEMBAR_NONE);
+UCM_DBG("Contig copy to gpu of size = %lld\n", contig_region_size);
             copying_gpu->ce_hal->memcopy(&push, dst_address, src_address, contig_region_size);
         }
 
@@ -5815,6 +6056,7 @@ static NV_STATUS block_cpu_insert_page(uvm_va_block_t *block,
     struct vm_area_struct *vma;
     NV_STATUS status;
     NvU64 addr = block->start + page_index * PAGE_SIZE;
+    uvm_va_space_t *va_space = get_shared_mem_va_space();
 
     UVM_ASSERT(va_range);
     UVM_ASSERT(va_range->type == UVM_VA_RANGE_TYPE_MANAGED);
@@ -5853,6 +6095,13 @@ static NV_STATUS block_cpu_insert_page(uvm_va_block_t *block,
     if (status != NV_OK)
         return status;
 
+    if (!va_space->skip_cache && block->cpu_map  && !block->cpu.page_from_cache[page_index]) {
+  //  	UCM_DBG("Page idx %d (addr = 0x%llx): Will populate from cache. \n",
+   // 		page_index, block->start + page_index * PAGE_SIZE);
+		if (uvm_populate_page_from_cache(block, page_index))
+			block->cpu.page_from_cache[page_index] = true;
+	} //else
+//UCM_ERR("skipepd populate\n");
     // Update block mapping state
     if (curr_prot != new_prot) {
         // Transitioning from Invalid -> RO or Invalid -> RW
@@ -6837,7 +7086,7 @@ void uvm_va_block_unmap_preferred_location_uvm_lite(uvm_va_block_t *va_block, uv
 //
 // Notably the caller needs to support allocation-retry as
 // uvm_va_block_migrate_locked() requires that.
-static NV_STATUS block_evict_pages_from_gpu(uvm_va_block_t *va_block, uvm_gpu_t *gpu)
+NV_STATUS block_evict_pages_from_gpu(uvm_va_block_t *va_block, uvm_gpu_t *gpu)
 {
     NV_STATUS status = NV_OK;
     unsigned long *resident = uvm_va_block_resident_mask_get(va_block, gpu->id);
@@ -6928,8 +7177,16 @@ static void block_kill(uvm_va_block_t *block)
     size_t i;
     uvm_va_block_region_t region = uvm_va_block_region_from_block(block);
 
-    if (!va_range)
+    if (!va_range ) {
+#if 0
+    	if (block->cpu.pages != NULL ) {
+    		//UCM_DBG("How come block has not va_range but pages were not free????");
+    		printk_ratelimited(KERN_CRIT "UCM-ERR: block_kill(): "
+    				" How come block has not va_range but pages were not free????\n");
+    	}
+#endif
         return;
+    }
 
     UVM_ASSERT(va_range->type == UVM_VA_RANGE_TYPE_MANAGED);
 
@@ -6967,9 +7224,33 @@ static void block_kill(uvm_va_block_t *block)
     if (block->cpu.pages) {
         for (i = 0; i < uvm_va_block_num_cpu_pages(block); i++) {
             if (block->cpu.pages[i]) {
+            //	ClearPageDirty(block->cpu.pages[i]);
+			//	ClearPagedirty_GPU(block->cpu.pages[i]);
+			//	ClearPageReferenced(block->cpu.pages[i]);
                 // be conservative.
                 // Tell the OS we wrote to the page because we sometimes clear the dirty bit after writing to it.
-                SetPageDirty(block->cpu.pages[i]);
+				if (PageonGPU(block->cpu.pages[i])) {
+					struct mem_cgroup *memcg = mem_cgroup_begin_page_stat(block->cpu.pages[i]);
+					unsigned long flags;
+					struct address_space *mapping = block->cpu.pages[i]->mapping;
+
+					//TODO: need to handle the pagedirty + cache. Flush?
+					__set_page_locked(block->cpu.pages[i]);
+					spin_lock_irqsave(&mapping->tree_lock, flags);
+					__delete_from_page_cache_gpu(block->cpu.pages[i], NULL, memcg, GPU_NVIDIA);
+					spin_unlock_irqrestore(&mapping->tree_lock, flags);
+					mem_cgroup_end_page_stat(memcg);
+					__clear_page_locked(block->cpu.pages[i]);
+					//UCM_DBG("deleted page at idx %ld to cache marked onGPU (gpu page =%d)\n", block->cpu.pages[i]->index, block->cpu.pages[i]->index/16);
+				}
+				if (block->cpu.pages[i]->private)
+					kfree(block->cpu.pages[i]->private);
+				//Clear the page before free
+				ClearPageonGPU(block->cpu.pages[i]);
+				block->cpu.pages[i]->mapping = NULL;
+
+//TODO: UCM should I close the dirty???
+
                 __free_page(block->cpu.pages[i]);
             }
             else {
@@ -6982,6 +7263,8 @@ static void block_kill(uvm_va_block_t *block)
         uvm_page_mask_zero(block->cpu.resident);
         block_clear_resident_processor(block, UVM_CPU_ID);
 
+        kfree(block->cpu.pages_diff);
+        kfree(block->cpu.page_from_cache);
         uvm_kvfree(block->cpu.pages);
     }
     else {
@@ -9017,6 +9300,10 @@ NV_STATUS uvm_va_block_read_to_cpu(uvm_va_block_t *va_block, uvm_mem_t *dst_mem,
     uvm_gpu_address_t dst_gpu_address;
     uvm_push_t push;
 
+    if (!block_is_page_resident_anywhere(va_block, page_index)) {
+    	UCM_ERR("Page idx %ld virt_addr=0x%llx not resident in UVM\n", page_index, src);
+    	return NV_ERR_INVALID_ADDRESS;
+    }
     uvm_assert_mutex_locked(&va_block->lock);
     UVM_ASSERT_MSG(UVM_ALIGN_DOWN(src, PAGE_SIZE) == UVM_ALIGN_DOWN(src + size - 1, PAGE_SIZE),
             "src 0x%llx size 0x%zx\n", src, size);

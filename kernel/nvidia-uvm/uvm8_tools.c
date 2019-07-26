@@ -1815,7 +1815,7 @@ static NV_STATUS tools_access_process_memory(uvm_va_space_t *va_space,
     uvm_mem_t *stage_mem;
     void *stage_addr;
 
-    status = uvm_mem_alloc_sysmem_and_map_cpu_kernel(PAGE_SIZE, &stage_mem);
+    status = uvm_mem_alloc_sysmem_and_map_cpu_kernel(PAGE_SIZE, &stage_mem, 0);
     if (status != NV_OK)
         return status;
 

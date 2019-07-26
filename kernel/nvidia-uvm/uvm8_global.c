@@ -178,7 +178,7 @@ error:
 void uvm_global_exit(void)
 {
     uvm_assert_mutex_unlocked(&g_uvm_global.global_lock);
-
+UCM_DBG("Enter");
     uvm8_unregister_callbacks();
     uvm_perf_heuristics_exit();
     uvm_perf_events_exit();
@@ -196,6 +196,7 @@ void uvm_global_exit(void)
 
     uvm_thread_context_exit();
     uvm_kvmalloc_exit();
+    UCM_DBG("Done");
 }
 
 void uvm_global_set_fatal_error_impl(NV_STATUS error)

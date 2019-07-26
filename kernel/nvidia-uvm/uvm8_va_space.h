@@ -136,6 +136,19 @@ struct uvm_gpu_va_space_struct
 
 };
 
+#define UVM_MAX_SUPPORTED_MMAPS 10
+struct uvm_va_mappings_struct
+{
+	//pointer to uvm vma
+	struct vm_area_struct *uvm_vma;
+	//vma handling this file
+	struct vm_area_struct *cpu_vma;
+	//start and end of of memory allocated by cudaMallocManaged
+	NvU64 start;
+	NvU64 end;
+	bool mapped;
+};
+
 struct uvm_va_space_struct
 {
     // Mask of gpus registered with the va space
@@ -159,6 +172,12 @@ struct uvm_va_space_struct
 
     // Tree of uvm_va_range_t's
     uvm_range_tree_t va_range_tree;
+
+
+	// Maaping array between cuda_uvm vma and mmaped(file) vma
+    struct uvm_va_mappings_struct mmap_array[UVM_MAX_SUPPORTED_MMAPS];
+    int mmap_arr_idx;
+    bool skip_cache;
 
     // Kernel mapping structure passed to unmap_mapping range to unmap CPU PTEs
     // in this process.
@@ -485,4 +504,5 @@ uvm_user_channel_t *uvm_gpu_va_space_get_user_channel(uvm_gpu_va_space_t *gpu_va
 NV_STATUS uvm8_test_enable_nvlink_peer_access(UVM_TEST_ENABLE_NVLINK_PEER_ACCESS_PARAMS *params, struct file *filp);
 NV_STATUS uvm8_test_disable_nvlink_peer_access(UVM_TEST_DISABLE_NVLINK_PEER_ACCESS_PARAMS *params, struct file *filp);
 
+uvm_va_space_t *get_shared_mem_va_space(void);
 #endif // __UVM8_VA_SPACE_H__

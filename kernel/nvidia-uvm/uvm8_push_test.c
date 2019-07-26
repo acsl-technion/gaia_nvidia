@@ -85,7 +85,7 @@ static NV_STATUS test_push_inline_data_gpu(uvm_gpu_t *gpu)
     uvm_mem_t *mem = NULL;
     char *verif;
 
-    status = uvm_mem_alloc_sysmem_and_map_cpu_kernel(UVM_PUSH_INLINE_DATA_MAX_SIZE, &mem);
+    status = uvm_mem_alloc_sysmem_and_map_cpu_kernel(UVM_PUSH_INLINE_DATA_MAX_SIZE, &mem, 0);
     TEST_CHECK_GOTO(status == NV_OK, done);
 
     status = uvm_mem_map_gpu_kernel(mem, gpu);

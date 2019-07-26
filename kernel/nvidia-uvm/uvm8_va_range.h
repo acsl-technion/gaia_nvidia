@@ -427,6 +427,12 @@ void uvm_va_range_zombify(uvm_va_range_t *va_range);
 
 NV_STATUS uvm_api_clean_up_zombie_resources(UVM_CLEAN_UP_ZOMBIE_RESOURCES_PARAMS *params, struct file *filp);
 
+NV_STATUS uvm_api_map_vma_range(UVM_MAP_VMA_RANGE_PARAMS *params, struct file *filp);
+NV_STATUS uvm_api_unmap_vma_range(UVM_UNMAP_VMA_RANGE_PARAMS *params, struct file *filp);
+#if 1
+NV_STATUS uvm_api_touch_vma_range(UVM_TOUCH_RANGE_PARAMS *params, struct file *filp);
+#endif
+
 // Inform the VA range that a GPU VA space is now available for them to map, if
 // the VA range is supposed to proactively map GPUs (UvmAllocSemaphorePool,
 // UvmSetAccessedBy).

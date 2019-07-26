@@ -201,6 +201,7 @@ static NV_STATUS uvm_mem_alloc_sysmem_chunks(uvm_mem_t *mem, size_t size)
     UVM_ASSERT(PAGE_ALIGNED(mem->chunk_size));
 
     mem->sysmem.pages = uvm_kvmalloc_zero(sizeof(*mem->sysmem.pages) * mem->chunks_count);
+//  UCM_ERR("Allocate %d chunks of mem->chunk_size=%ld \n", mem->chunks_count, mem->chunk_size);
     if (!mem->sysmem.pages) {
         status = NV_ERR_NO_MEMORY;
         goto error;

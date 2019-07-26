@@ -55,6 +55,7 @@
 #include <linux/file.h>             /* fget()                           */
 
 #include <linux/percpu.h>
+#include <linux/memcontrol.h>
 
 #if defined(NV_LINUX_PRINTK_H_PRESENT)
 #include <linux/printk.h>

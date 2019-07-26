@@ -37,6 +37,10 @@
 #include "uvm8_hmm.h"
 #include "uvm8_mem.h"
 
+#include "/home/tanya/Linux4.4.115-UCM/include/linux/ucm.h"
+#include <linux/list.h>
+
+
 static struct cdev g_uvm_cdev;
 
 static int uvm_open(struct inode *inode, struct file *filp)
@@ -51,7 +55,7 @@ static int uvm_open(struct inode *inode, struct file *filp)
 static int uvm_release(struct inode *inode, struct file *filp)
 {
     uvm_va_space_destroy(filp);
-
+//UCM_DBG("Enter\n");
     return -nv_status_to_errno(uvm_global_get_status());
 }
 
@@ -288,7 +292,7 @@ static void uvm_vm_close_managed(struct vm_area_struct *vma)
     uvm_va_space_t *va_space = uvm_va_space_get(vma->vm_file);
     uvm_gpu_t *gpu;
     bool is_uvm_teardown = false;
-
+//UCM_DBG("Enter\n");
     if (current->mm != NULL)
         uvm_record_lock_mmap_sem_write(&current->mm->mmap_sem);
 
@@ -321,6 +325,7 @@ static void uvm_vm_close_managed(struct vm_area_struct *vma)
 
     if (current->mm != NULL)
         uvm_record_unlock_mmap_sem_write(&current->mm->mmap_sem);
+//    UCM_DBG("Done\n");
 }
 
 static int uvm_vm_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
@@ -452,6 +457,513 @@ static struct vm_operations_struct uvm_vm_ops_managed =
 #endif
 };
 
+static struct file *uvm_vm_get_mmaped_file(struct vm_area_struct *vma, unsigned long start, unsigned long end)
+{
+	struct uvm_va_mappings_struct *map = uvm_get_cpu_mapping(get_shared_mem_va_space(), start, end); 
+
+//	UCM_DBG("enter for virt_addr = 0x%llx\n", start);
+
+	if (!map)
+		return NULL;
+	return map->cpu_vma->vm_file;
+}
+
+unsigned long int uvm_get_cpu_addr(struct vm_area_struct *vma, unsigned long start, unsigned long end)
+{
+	struct uvm_va_mappings_struct *map = uvm_get_cpu_mapping(get_shared_mem_va_space(), start, end); 
+
+	if (!map)
+		return 0;
+//UCM_DBG("returning 0x%llx\n", map->cpu_vma->vm_start);
+	return map->cpu_vma->vm_start;
+}
+
+static int uvm_vm_retrive_16cached_pages_multi_orig(unsigned long virt_addr, struct page *cpu_pages[])
+{
+	uvm_va_space_t *va_space = get_shared_mem_va_space();
+	uvm_va_block_t *va_block;
+	NV_STATUS status = NV_OK;
+	int ret = 0, i;
+	uvm_va_block_region_t block_region;
+	uvm_va_block_context_t *block_context = uvm_va_block_context_alloc();
+	//struct page *ucm_page;
+	NvU64 page_index ;
+	int num_pages = 16;
+
+	uvm_mem_t dst_mem;
+
+	if (!cpu_pages) {
+		UCM_ERR("cpu_page = null\n");
+		return 0;
+	}
+//UCM_DBG("Enter for virtaddr=0x%llx, num_pages = %d\n ", virt_addr, num_pages);
+	if (!block_context) {
+		UCM_ERR("cpublock_context = null\n");
+		return 0;
+	}
+
+	uvm_va_space_down_read(va_space);
+//	UCM_ERR("looking for a block\n");
+	status = uvm_va_block_find(va_space, virt_addr, &va_block);
+	if (status != NV_OK)
+        goto out;
+
+//	if (virt_addr + PAGE_SIZE * num_pages > va_block->end) {
+//		UCM_ERR("Cant get %d pages from 0x%llx, block ends at 0x%llx\n", num_pages, virt_addr, va_block->end);
+//		goto out;
+//	}
+
+	dst_mem.backing_gpu = NULL;
+	dst_mem.chunk_size = PAGE_SIZE;
+	dst_mem.chunks_count = num_pages;
+	dst_mem.sysmem.pages = uvm_kvmalloc_zero(sizeof(*dst_mem.sysmem.pages) * num_pages);
+    if (!dst_mem.sysmem.pages) {
+        ret = NV_ERR_NO_MEMORY;
+        goto out;
+    }
+    dst_mem.size = PAGE_SIZE * num_pages;
+
+    for (i = 0; i < 16; i++) {
+		struct page *page = cpu_pages[i];
+		if (!page) {
+			UCM_ERR("NULL page!!! i = %d\n", i);
+			uvm_kvfree(dst_mem.sysmem.pages);
+			goto out;
+		}
+		ret++;
+		dst_mem.sysmem.pages[i] = page;
+	}
+
+    //UCM_DBG("mapping cpu page\n ");
+	//dst_mem.kernel.cpu_addr = kmap(cpu_page);
+
+
+    dst_mem.kernel.cpu_addr = vmap(dst_mem.sysmem.pages, num_pages, VM_MAP, PAGE_KERNEL);
+
+    if (dst_mem.chunk_size != PAGE_SIZE) {
+    	UCM_ERR("Map failed\n");
+		ret = NV_ERR_NO_MEMORY;
+		goto out;
+    }
+
+    if (!dst_mem.kernel.cpu_addr) {
+    	UCM_ERR("Map failed\n");
+    	status = NV_ERR_NO_MEMORY;
+    	goto out;
+    }
+
+	status = uvm_va_block_read_to_cpu(va_block, &dst_mem, virt_addr, PAGE_SIZE * num_pages);
+	if (status != NV_OK) {
+		UCM_DBG("uvm_va_block_read_to_cpu for vrt_addr=0x%llx failed status = %d\n", virt_addr, status);
+		vunmap(dst_mem.kernel.cpu_addr);
+		goto out;
+	}
+//UCM_DBG("uvm_va_block_read_to_cpu for vrt_addr=0x%llx worked\n", virt_addr);
+
+	page_index = uvm_va_block_cpu_page_index(va_block, virt_addr);
+//	UCM_DBG("page_index=%ld\n ", page_index);
+	memcpy(va_block->cpu.pages_diff[page_index], dst_mem.kernel.cpu_addr, PAGE_SIZE * num_pages);
+	//kunmap(cpu_page);
+
+	if (dst_mem.kernel.cpu_addr != NULL) {
+		vunmap(dst_mem.kernel.cpu_addr);
+		dst_mem.kernel.cpu_addr = NULL;
+	} else
+		UCM_ERR("How come cpu_addr = null\n");
+
+	uvm_kvfree(dst_mem.sysmem.pages);
+	ret =  num_pages;
+
+out:
+	uvm_va_space_up_read(va_space);
+	uvm_va_block_context_free(block_context);
+//	UCM_DBG("Done ret = %d\n", ret);
+	return ret;
+}
+
+static int uvm_vm_retrive_16cached_pages_multi(unsigned long virt_addr, struct page *cpu_pages[])
+{
+	uvm_va_space_t *va_space = get_shared_mem_va_space();
+	uvm_va_block_t *va_block;
+	NV_STATUS status = NV_OK;
+	int ret = 0, i;
+	uvm_va_block_region_t block_region;
+	//struct page *ucm_page;
+	NvU64 page_index ;
+
+	uvm_mem_t *stage_mem;
+	void *stage_addr;
+	char *tmp_addr;
+
+	if (!cpu_pages) {
+		UCM_ERR("cpu_page = null\n");
+		return 0;
+	}
+
+//	if (cpu_pages[0]->index/16 > 490)
+//		UCM_DBG("Enter for virtaddr=0x%llx first page idx=%d, last page idx=%d, gpu page idx=%lld\n ",
+//				virt_addr, cpu_pages[0]->index, cpu_pages[15]->index, cpu_pages[0]->index/16);
+
+	status = uvm_mem_alloc_sysmem_and_map_cpu_kernel(PAGE_SIZE *16, &stage_mem, PAGE_SIZE *16);
+	if (status != NV_OK) {
+		UCM_ERR("failed to allocate mem\n");
+		return status;
+	}
+	stage_addr = uvm_mem_get_cpu_addr_kernel(stage_mem);
+	uvm_va_space_down_read_rm(va_space);
+	{
+
+	//	UCM_ERR("looking for a block\n");
+		status = uvm_va_block_find_create(va_space, virt_addr, &va_block);
+		if (status != NV_OK) {
+			UCM_ERR("failed\n");
+			uvm_va_space_up_read_rm(va_space);
+			goto out;
+		}
+
+		status = UVM_VA_BLOCK_LOCK_RETRY(va_block, NULL,
+				uvm_va_block_read_to_cpu(va_block, stage_mem, virt_addr, PAGE_SIZE*16));
+
+		page_index = uvm_va_block_cpu_page_index(va_block, virt_addr);
+		// For simplicity, check for ECC errors on all GPUs registered in the VA
+		// space as tools read/write is not on a perf critical path.
+		if (status == NV_OK)
+			status = uvm_gpu_check_ecc_error_mask(&va_space->registered_gpus);
+	}
+	if (status != NV_OK) {
+		UCM_DBG("uvm_va_block_read_to_cpu for vrt_addr=0x%llx failed status = %d\n", virt_addr, status);
+		uvm_mem_free(stage_mem);
+		goto out;
+	}
+
+	for (i =0; i < 16; i++){/*
+		uvm_va_space_down_read_rm(va_space);
+		status = UVM_VA_BLOCK_LOCK_RETRY(va_block, NULL,
+					uvm_va_block_read_to_cpu(va_block, stage_mem, virt_addr, PAGE_SIZE));
+		if (status == NV_OK)
+			status = uvm_gpu_check_ecc_error_mask(&va_space->registered_gpus);
+		uvm_va_space_up_read_rm(va_space);*/
+
+		tmp_addr = (char *)kmap(cpu_pages[i]);
+		memcpy(tmp_addr, stage_addr + i*4096, PAGE_SIZE);
+
+		//aardvark
+	//	if (*tmp_addr != 'a' || *(tmp_addr+1) != 'a' || *(tmp_addr+2) != 'r' || *(tmp_addr+3) != 'd')
+	//		UCM_ERR("i=%d : %c%c%c%c  gpu page idx =%lld\n",i, *tmp_addr, *(tmp_addr+1), *(tmp_addr+2), *(tmp_addr+3), cpu_pages[0]->index/16);
+		// Update the shadow copy as well since we merged the changes to the cpu page
+		memcpy(va_block->cpu.pages_diff[page_index+i], tmp_addr, PAGE_SIZE);
+		kunmap(cpu_pages[i]);
+	}
+
+	uvm_va_space_up_read_rm(va_space);
+	uvm_mem_free(stage_mem);
+	ret =  16;
+
+out:
+
+//	UCM_DBG("Done ret = %d\n", ret);
+	return ret;
+}
+
+static long int zero_page[512] = {0};
+static int uvm_vm_retrive_cached_page(unsigned long virt_addr, struct page *cpu_page)
+{
+	uvm_va_space_t *va_space = get_shared_mem_va_space();
+	int ret = 0;	int i;
+	uvm_va_block_t *block;
+	NV_STATUS status = NV_OK;
+	int page_idx = 0;
+	char *tmp_addr;
+	long int *shadow, *from_gpu, *merged;
+
+	uvm_mem_t *stage_mem;
+	void *stage_addr;
+//UCM_DBG("Eneter\n");
+	status = uvm_mem_alloc_sysmem_and_map_cpu_kernel(PAGE_SIZE, &stage_mem, 0);
+	if (status != NV_OK) {
+		UCM_ERR("failed to allocate mem\n");
+		return status;
+	}
+	 stage_addr = uvm_mem_get_cpu_addr_kernel(stage_mem);
+
+	// The RM flavor of the lock is needed to perform ECC checks.
+	{
+		uvm_va_space_down_read_rm(va_space);
+		status = uvm_va_block_find_create(va_space, virt_addr, &block);
+		if (status != NV_OK) {
+			UCM_ERR("failed\n");
+			uvm_va_space_up_read_rm(va_space);
+			goto out;
+		}
+		status = UVM_VA_BLOCK_LOCK_RETRY(block, NULL,
+							 uvm_va_block_read_to_cpu(block, stage_mem, virt_addr, PAGE_SIZE));
+		page_idx = uvm_va_block_cpu_page_index(block, virt_addr);
+		// For simplicity, check for ECC errors on all GPUs registered in the VA
+		// space as tools read/write is not on a perf critical path.
+		if (status == NV_OK)
+			status = uvm_gpu_check_ecc_error_mask(&va_space->registered_gpus);
+
+		uvm_va_space_up_read_rm(va_space);
+	}
+
+	if (status != NV_OK) {
+		UCM_ERR("read failed\n");
+		goto out;
+	}
+
+	tmp_addr = (char *)kmap(cpu_page);
+	/*
+	 * Before I do a plain memcpy of 4KB I need to make sure the page was not updated by the GPU
+	 * if it was, I need to merge the changes into the cpu page.
+	 * Before doing that I need to first understand if the cpu page contains data and I need to
+	 * merge or just get the page. This can be done bu comparing the cpu page to 0. I assume newly
+	 * allocated page will be zerowed out.
+	 */
+#if 0
+	if (!memcmp( tmp_addr, zero_page, PAGE_SIZE)) {
+		char *gpu_data = (char *)uvm_mem_get_cpu_addr_kernel(stage_mem);
+	//	UCM_DBG("The cpu page is clean - idx = %ld. gpu page data =%c%c%c\n",
+	//			cpu_page->index, *gpu_data, *(gpu_data +1), *(gpu_data+2));
+		memcpy(tmp_addr, uvm_mem_get_cpu_addr_kernel(stage_mem), PAGE_SIZE);
+	} else
+#endif
+	if (!memcmp( block->cpu.pages_diff[page_idx], uvm_mem_get_cpu_addr_kernel(stage_mem), PAGE_SIZE)) {
+		memcpy(tmp_addr, uvm_mem_get_cpu_addr_kernel(stage_mem), PAGE_SIZE);
+	}else {
+		//If I got here need to get diff from gpu
+		shadow = (long int *)block->cpu.pages_diff[page_idx];
+		from_gpu = (long int*)uvm_mem_get_cpu_addr_kernel(stage_mem);
+		merged = (long int *)tmp_addr;
+		for (i = 0; i < PAGE_SIZE/sizeof(long int) ; i++) {
+			if (shadow[i] != from_gpu[i])
+				merged[i] =  from_gpu[i];
+		}
+	}
+	// Update the shadow copy as well since we merged the changes to the cpu page
+	memcpy(block->cpu.pages_diff[page_idx], tmp_addr, PAGE_SIZE);
+
+done:
+	kunmap(cpu_page);
+
+//	uvm_mem_unmap_cpu(stage_addr);
+	uvm_mem_free(stage_mem);
+out:
+
+	//UCM_DBG("Done ret = %d for idx=%ld\n", ret, cpu_page->index);
+	return ret;
+}
+
+static int uvm_vm_retrive_16cached_pages(unsigned long virt_addr, struct page *cpu_pages[])
+{
+	int i;
+	int ret = 0;
+	for (i = 0; i< 16; i++)
+		ret += (!uvm_vm_retrive_cached_page(virt_addr + PAGE_SIZE*i, cpu_pages[i]) ? 1 : 0);
+	return ret;
+}
+
+static int uvm_vm_retrive_cached_page_old(unsigned long virt_addr, struct page *cpu_page)
+{
+	uvm_va_space_t *va_space = get_shared_mem_va_space();
+	uvm_va_block_t *va_block;
+	NV_STATUS status = NV_OK;
+	int ret = -1, i;
+	uvm_va_block_region_t block_region;
+	NvU64 page_index ;
+
+	uvm_mem_t dst_mem;
+
+	if (!cpu_page) {
+		UCM_ERR("cpu_page = null\n");
+		return 0;
+	}
+
+//	uvm_va_space_down_read(va_space);
+UCM_ERR("Read from GPU virt addr 0x%llx. page flags = 0x%llx\n", virt_addr, cpu_page->flags);
+
+	dst_mem.backing_gpu = NULL;
+	dst_mem.chunk_size = PAGE_SIZE;
+	dst_mem.chunks_count = 1;
+	dst_mem.sysmem.pages = uvm_kvmalloc_zero(sizeof(*dst_mem.sysmem.pages));
+    if (!dst_mem.sysmem.pages) {
+        ret = NV_ERR_NO_MEMORY;
+        goto out;
+    }
+    dst_mem.size = PAGE_SIZE;
+    dst_mem.sysmem.pages[0] = cpu_page;
+
+    //UCM_DBG("mapping cpu page\n ");
+	//dst_mem.kernel.cpu_addr = kmap(cpu_page);
+
+
+    dst_mem.kernel.cpu_addr = vmap(dst_mem.sysmem.pages, 1, VM_MAP, PAGE_KERNEL);
+
+    if (!dst_mem.kernel.cpu_addr) {
+    	UCM_ERR("Map failed\n");
+    	status = NV_ERR_NO_MEMORY;
+    	uvm_kvfree(dst_mem.sysmem.pages);
+    	goto out;
+    }
+
+    // The RM flavor of the lock is needed to perform ECC checks.
+	uvm_va_space_down_read_rm(va_space);
+	status = uvm_va_block_find_create(va_space, virt_addr, &va_block);
+	if (status != NV_OK) {
+		uvm_va_space_up_read_rm(va_space);
+		goto out;
+	}
+	status = UVM_VA_BLOCK_LOCK_RETRY(va_block, NULL,
+			                     uvm_va_block_read_to_cpu(va_block, &dst_mem, virt_addr, PAGE_SIZE));
+	// For simplicity, check for ECC errors on all GPUs registered in the VA
+	// space as tools read/write is not on a perf critical path.
+	if (status == NV_OK)
+		status = uvm_gpu_check_ecc_error_mask(&va_space->registered_gpus);
+
+	uvm_va_space_up_read_rm(va_space);
+	if (status != NV_OK) {
+		UCM_DBG("uvm_va_block_read_to_cpu for vrt_addr=0x%llx failed status = %d\n", virt_addr, status);
+		vunmap(dst_mem.kernel.cpu_addr);
+		uvm_kvfree(dst_mem.sysmem.pages);
+		goto out;
+	}
+//UCM_DBG("uvm_va_block_read_to_cpu for vrt_addr=0x%llx worked\n", virt_addr);
+
+	page_index = uvm_va_block_cpu_page_index(va_block, virt_addr);
+//	UCM_DBG("page_index=%ld\n ", page_index);
+	memcpy(va_block->cpu.pages_diff[page_index], dst_mem.kernel.cpu_addr, PAGE_SIZE);
+	//kunmap(cpu_page);
+
+	if (dst_mem.kernel.cpu_addr != NULL) {
+		vunmap(dst_mem.kernel.cpu_addr);
+		dst_mem.kernel.cpu_addr = NULL;
+	} else
+		UCM_ERR("How come cpu_addr = null\n");
+
+	uvm_kvfree(dst_mem.sysmem.pages);
+	ret =  0;
+
+out:
+	UCM_DBG("Done for idx = %d. ret = %d\n", cpu_page->index, ret);
+	return ret;
+}
+
+static int uvm_vm_invalidate_cached_page(struct vm_area_struct *vma, unsigned long virt_addr)
+{
+	uvm_va_space_t *va_space = get_shared_mem_va_space();
+	uvm_va_block_t *va_block;
+	NV_STATUS status = NV_OK;
+	int ret = -1, i;
+	size_t page_index;
+	uvm_va_block_context_t *block_context = uvm_va_block_context_alloc();
+	 uvm_gpu_t *gpu;
+
+
+	UCM_DBG("enter for virt_addr = 0x%llx\n", virt_addr);
+
+	uvm_va_space_down_read(va_space);
+	status = uvm_va_block_find(va_space, virt_addr, &va_block);
+	if (status != NV_OK) {
+		UCM_ERR("Didn't find block\n");
+        goto out;
+	}
+	
+	page_index = (virt_addr - va_block->start)/PAGE_SIZE;
+	//need to migrate the pages back to CPU. 
+	if (page_index % 16)
+		UCM_DBG("No aligned to page size idx=%d\n\n\n\n\n", page_index);
+
+	gpu = uvm_processor_mask_find_first_gpu(&va_space->registered_gpus);
+	uvm_mutex_lock(&va_block->lock);
+	status = UVM_VA_BLOCK_RETRY_LOCKED(va_block, NULL, block_evict_pages_from_gpu(va_block, gpu));
+	if (status != NV_OK) {
+		UCM_ERR("Failed to evict GPU pages on GPU unregister: %s, GPU %s\n", nvstatusToString(status), gpu->name);
+		uvm_global_set_fatal_error(status);
+		uvm_mutex_unlock(&va_block->lock);
+		goto out;
+	}
+	uvm_mutex_unlock(&va_block->lock);
+
+	for (i = page_index; i <= page_index + 15; i++) {
+		va_block->cpu.page_from_cache[i] = false;
+	}
+//UCM_DBG("invalidated block [0x%llx, 0x%llx]\n",va_block->start, va_block->end);
+
+	ret = 0;
+
+out:
+	uvm_va_space_up_read(va_space);
+	uvm_va_block_context_free(block_context);
+	return ret;
+}
+
+static int uvm_vm_is_gpu_page_dirty(struct vm_area_struct *shared_vma, struct page *gpu_page) {
+	uvm_va_space_t *va_space = get_shared_mem_va_space();
+	int ret = 0;	int i;
+	uvm_va_block_t *block;
+	NV_STATUS status = NV_OK;
+	struct ucm_page_data *pdata = (struct ucm_page_data *)gpu_page->private;
+	unsigned long gpu_page_addr = pdata->shared_addr;
+	int page_idx = 0;
+
+	//bring the pages from gpu by simulating a page fault
+	ret = 0;//uvm_vm_fault(shared_vma, &vmf);
+
+	//compare to the cpu cached version
+	for (i = 0; i <16; i++) {
+		uvm_mem_t *stage_mem;
+		void *stage_addr;
+
+		status = uvm_mem_alloc_sysmem_and_map_cpu_kernel(PAGE_SIZE, &stage_mem, 0);
+		if (status != NV_OK)
+			return status;
+		 stage_addr = uvm_mem_get_cpu_addr_kernel(stage_mem);
+
+		// The RM flavor of the lock is needed to perform ECC checks.
+		uvm_va_space_down_read_rm(va_space);
+		status = uvm_va_block_find_create(va_space, gpu_page_addr + i*PAGE_SIZE, &block);
+		if (status != NV_OK) {
+			uvm_va_space_up_read_rm(va_space);
+			break;
+		}
+		status = UVM_VA_BLOCK_LOCK_RETRY(block, NULL,
+		                     uvm_va_block_read_to_cpu(block, stage_mem, gpu_page_addr + i*PAGE_SIZE, PAGE_SIZE));
+		page_idx = uvm_va_block_cpu_page_index(block, gpu_page_addr + i*PAGE_SIZE);
+		// For simplicity, check for ECC errors on all GPUs registered in the VA
+		// space as tools read/write is not on a perf critical path.
+		if (status == NV_OK)
+			status = uvm_gpu_check_ecc_error_mask(&va_space->registered_gpus);
+
+		uvm_va_space_up_read_rm(va_space);
+		if (status != NV_OK)
+			break;
+
+		if (memcmp(stage_addr , block->cpu.pages_diff[page_idx], PAGE_SIZE)) {
+			ret = 1;
+		//	UCM_DBG("gpu page dirty at virt addr virt addr 0x%llx \n", gpu_page_addr);
+			break;
+		}// else
+		//	UCM_DBG("gpu page CLEAN at virt addr virt addr 0x%llx \n", gpu_page_addr);
+		uvm_mem_free(stage_mem);
+	}
+//	uvm_mem_unmap_cpu(stage_addr);
+
+out:
+
+//	UCM_DBG("Done ret = %d\n", ret);
+	return ret;
+}
+
+
+struct vm_ucm_operations_struct uvm_ucm_ops_managed =
+{
+	.get_mmaped_file = uvm_vm_get_mmaped_file,
+	.get_cpu_addr = uvm_get_cpu_addr,
+	.invalidate_cached_page = uvm_vm_invalidate_cached_page,
+	.retrive_cached_page = uvm_vm_retrive_cached_page,
+	.retrive_16cached_pages = uvm_vm_retrive_16cached_pages_multi, //uvm_vm_retrive_16cached_pages2,
+	.is_gpu_page_dirty = uvm_vm_is_gpu_page_dirty,
+};
+
 // vm operations on semaphore pool allocations only control CPU mappings. Unmapping GPUs,
 // freeing the allocation, and destroying the va_range are handled by UVM_FREE.
 static void uvm_vm_open_semaphore_pool(struct vm_area_struct *vma)
@@ -581,6 +1093,10 @@ static int uvm_mmap(struct file *filp, struct vm_area_struct *vma)
     vma->vm_flags |= VM_MIXEDMAP | VM_DONTEXPAND;
 
     vma->vm_ops = &uvm_vm_ops_managed;
+    vma->ucm_vm_ops = &uvm_ucm_ops_managed;
+
+UCM_DBG("Setting vma 0x%llx as gpu_managed (file = %s)\n", vma, filp->f_path.dentry->d_iname);
+    vma->gpu_mapped_shared = true;
 
     // This identity assignment is needed so uvm_vm_open can find its parent vma
     vma->vm_private_data = uvm_vma_wrapper_alloc(vma);
@@ -680,6 +1196,9 @@ static long uvm_unlocked_ioctl(struct file *filp, unsigned int cmd, unsigned lon
         UVM_ROUTE_CMD_STACK(UVM_TOOLS_FLUSH_EVENTS,             uvm_api_tools_flush_events);
         UVM_ROUTE_CMD_ALLOC(UVM_ALLOC_SEMAPHORE_POOL,           uvm_api_alloc_semaphore_pool);
         UVM_ROUTE_CMD_STACK(UVM_CLEAN_UP_ZOMBIE_RESOURCES,      uvm_api_clean_up_zombie_resources);
+	UVM_ROUTE_CMD_STACK(UVM_MAP_VMA_RANGE,			uvm_api_map_vma_range);
+	UVM_ROUTE_CMD_STACK(UVM_UNMAP_VMA_RANGE,          	uvm_api_unmap_vma_range);
+	UVM_ROUTE_CMD_STACK(UVM_TOUCH_RANGE,          		uvm_api_touch_vma_range);
     }
 
     // Try the test ioctls if none of the above matched
@@ -697,6 +1216,8 @@ static const struct file_operations uvm_fops =
 #endif
     .owner           = THIS_MODULE,
 };
+
+
 
 int uvm8_init(dev_t uvm_base_dev)
 {

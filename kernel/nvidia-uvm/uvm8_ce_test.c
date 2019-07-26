@@ -360,7 +360,7 @@ static NV_STATUS test_memcpy_and_memset(uvm_gpu_t *gpu)
     size_t i, j, k, s;
     uvm_mem_alloc_params_t mem_params = {0};
 
-    status = uvm_mem_alloc_sysmem_and_map_cpu_kernel(MEM_TEST_SIZE, &verif_mem);
+    status = uvm_mem_alloc_sysmem_and_map_cpu_kernel(MEM_TEST_SIZE, &verif_mem, 0);
     if (status != NV_OK)
         goto done;
     status = uvm_mem_map_gpu_kernel(verif_mem, gpu);

@@ -516,6 +516,241 @@ NV_STATUS uvm_api_clean_up_zombie_resources(UVM_CLEAN_UP_ZOMBIE_RESOURCES_PARAMS
     return NV_OK;
 }
 
+/**
+ * uvm_api_map_vma_range() - Add a mapping between uvm_va_space_t and vm_area_struct
+ *
+ * This function adds a mapping between nvidia va_space and the vm_area
+ * created for the mmaped file. It receives two addreses (in params):
+ * uvm_base - the virtual address as returned by cudaMAllocManaged. Should
+ *	    fall in the limits of current->mm->vma["nvidia_uvm"] -> [vm_start, vm_end]
+ * cpu_base - the virtual address returned by mmap("myfile"). Pointing
+ *	    to the base of vm_are_struct allocated in process memory space for the
+ *	    mmaped file
+ */
+NV_STATUS uvm_api_map_vma_range(UVM_MAP_VMA_RANGE_PARAMS *params, struct file *filp)
+{
+    uvm_va_space_t *va_space = get_shared_mem_va_space();//uvm_va_space_get(filp);
+    int i = 0;
+    struct vm_area_struct *cpu_vma; //this is the vma created for map
+    struct vm_area_struct *uvm_vma; //this is the vma created for uvm
+    NV_STATUS ret = NV_OK;
+    struct uvm_va_mappings_struct *new_map;
+    
+    //UCM_DBG("(file=%s) enter for uvm_base = 0x%llx cpu_base = 0x%llx\n", filp->f_path.dentry->d_iname,
+//	params->uvm_base, params->cpu_base);
+
+    if (!va_space) {
+	UCM_ERR("va_space is null\n");
+	ret = NV_ERR_GENERIC;
+	goto out;
+    }
+    uvm_va_space_down_write(va_space);
+
+	/* locate cpu vma in our mm ciresponding to params->cpu_base */
+    cpu_vma = current->mm->mmap;
+    while (i < current->mm->map_count && cpu_vma) {
+	if (cpu_vma->vm_start == params->cpu_base && cpu_vma->gpu_mapped) {
+		//UCM_DBG(" found cpu_vma! =%p\n", cpu_vma);
+		break;
+	}
+	cpu_vma = cpu_vma->vm_next;
+	i++;
+    }
+	if (!cpu_vma) {
+		UCM_ERR("didn find cpu_vma for the given addr 0x%llx:\n", params->cpu_base);
+		ret = NV_ERR_GENERIC;
+		goto out;
+	}
+
+	/* locate uvm vma in our mm that is marked as gpu_managed */
+    uvm_vma = current->mm->mmap;
+    while (i < current->mm->map_count && uvm_vma) {
+	if (uvm_vma->gpu_mapped_shared) {
+		//UCM_DBG(" found uvm_vma! =%p\n", uvm_vma);
+		break;
+	}
+	uvm_vma = uvm_vma->vm_next;
+	i++;
+    }
+	if (!uvm_vma) {
+		UCM_ERR("didn find uvm_vma for the given process\n");
+		ret = NV_ERR_GENERIC;
+		goto out;
+	}
+
+	new_map = &va_space->mmap_array[va_space->mmap_arr_idx++];
+	if (new_map->mapped) {
+		UCM_ERR("Entry at idx %d mapped\n", --va_space->mmap_arr_idx);
+		ret = NV_ERR_GENERIC;
+		goto out;
+	}
+	new_map->uvm_vma = uvm_vma;
+	new_map->start = params->uvm_base;
+	new_map->cpu_vma = cpu_vma;
+	new_map->end = new_map->start + (cpu_vma->vm_end - cpu_vma->vm_start);
+	new_map->mapped = true;
+
+	BUG_ON(!cpu_vma->vm_file);
+	INIT_LIST_HEAD(&cpu_vma->vm_file->f_mapping->gpu_lra);
+	cpu_vma->vm_file->f_mapping->gpu_cached_data_sz = 0;
+	cpu_vma->vm_file->f_mapping->gpu_cache_sz = 10;
+//UCM_DBG("added new mapping at (uvm_vma=0x%llx) idx %d for nvidia_vma[0x%llx - 0x%llx], cpu_vma[0x%llx, 0x%llx]\n",
+//va_space, va_space->mmap_arr_idx-1, new_map->start, new_map->end, cpu_vma->vm_start, cpu_vma->vm_end);
+
+out:
+    uvm_va_space_up_write(va_space);
+    return ret;
+}
+
+static void cleanup_cache(struct vm_area_struct *cpu_vma) {
+
+	int unmapped_error = 0;
+	int error = -EINVAL;
+	struct file *mfile = NULL;
+	//struct pagevec pvec;
+	int nr_pages;
+	pgoff_t index, end;
+
+	int num_gpu_pages = 0;
+	index = 0;
+	end = (cpu_vma->vm_end - cpu_vma->vm_start)/PAGE_SIZE;
+
+	if (!cpu_vma)
+		return;
+	while ((index <= end) ) {
+		unsigned i;
+		int gpu_page_idx = -1;
+		int *pages_idx;
+		unsigned long tagged, tagged_gpu;
+
+		pages_idx = (int*)kzalloc(sizeof(int)*(end - index + 1), GFP_KERNEL);
+		if (!pages_idx) {
+			UCM_ERR("Error allocating memory!\n");
+			goto out;
+		}
+		nr_pages = find_get_taged_pages_idx(cpu_vma->vm_file->f_mapping, &index,
+				end - index + 1, pages_idx, PAGECACHE_TAG_ON_GPU);
+
+		if (!nr_pages) {
+			//UCM_DBG("No pages taged as ON_GPU: index = %ld, nrpages=%ld\n", index, end - index + 1);
+			break;
+		}
+		UCM_DBG("got %d pages taged ON_GPU\n", nr_pages);
+		for (i = 0; i < nr_pages; i++) {
+			int page_idx = pages_idx[i];
+			/* until radix tree lookup accepts end_index */
+			if (page_idx > end) {
+				continue;
+			}
+			if (1) { //(gpu_page_idx == -1) || (gpu_page_idx != page_idx % 16)) {
+				struct page *gpu_page = pagecache_get_gpu_page(cpu_vma->vm_file->f_mapping, page_idx, GPU_NVIDIA, true);
+				if (gpu_page) {
+					struct mem_cgroup *memcg = mem_cgroup_begin_page_stat(gpu_page);
+					unsigned long flags;
+					struct address_space *mapping = cpu_vma->vm_file->f_mapping;
+
+					__set_page_locked(gpu_page);
+					spin_lock_irqsave(&mapping->tree_lock, flags);
+					__delete_from_page_cache_gpu(gpu_page, NULL, memcg, GPU_NVIDIA);
+					spin_unlock_irqrestore(&mapping->tree_lock, flags);
+					mem_cgroup_end_page_stat(memcg);
+					__clear_page_locked(gpu_page);
+					num_gpu_pages++;
+				}
+			}
+		}
+		kfree(pages_idx);
+	}
+
+out:
+UCM_DBG("done. num_gpu_pages=%d \n",num_gpu_pages);
+	return ;
+}
+
+/**
+ * uvm_api_unmap_vma_range() - TODO
+ *
+ */
+NV_STATUS uvm_api_unmap_vma_range(UVM_UNMAP_VMA_RANGE_PARAMS *params, struct file *filp)
+{
+    uvm_va_space_t *va_space =  get_shared_mem_va_space();//uvm_va_space_get(filp);
+    int i = 0;
+    NV_STATUS ret = NV_OK;
+    struct uvm_va_mappings_struct *new_map;
+    //UCM_DBG("enter for uvm_base = 0x%llx and uvm_va=%p\n", params->uvm_base, va_space);
+
+    // Locate current mapping in the array
+    for (i = 0; i < va_space->mmap_arr_idx; i++) {
+	new_map = &va_space->mmap_array[i];
+	if (new_map->start == params->uvm_base) {
+//UCM_DBG("founed the entry for addr 0x%llx at idx %dnew_map->cpu_vma = 0x%llx\n", new_map->start, i, new_map->cpu_vma);
+		//cleanup_cache(new_map->cpu_vma);
+		new_map->mapped = false;
+		va_space->mmap_arr_idx--;
+		return ret;
+	}
+    }
+    UCM_ERR("didnt find the mapping for addr 0x%llx\n", new_map->start);
+    return NV_ERR_GENERIC;
+}
+#if 1
+/**
+ * uvm_api_touch_vma_range() - TODO
+ *
+ */
+NV_STATUS uvm_api_touch_vma_range(UVM_TOUCH_RANGE_PARAMS *params, struct file *filp)
+{
+    uvm_va_space_t *va_space = get_shared_mem_va_space();//uvm_va_space_get(filp);
+    int i = 0;
+    NV_STATUS ret = NV_OK;
+    struct vm_area_struct *uvm_vma;
+    NvU64 fault_addr = params->start_addr;
+    
+    uvm_vma = current->mm->mmap;
+    while (i < current->mm->map_count && uvm_vma) {
+        if (uvm_vma->gpu_mapped_shared) {
+            //    UCM_DBG(" found uvm_vma! =%p\n", uvm_vma);
+                break;
+        }
+        uvm_vma = uvm_vma->vm_next;
+        i++;
+    }
+	va_space->skip_cache = !va_space->skip_cache;
+//UCM_DBG("Set va_space->skip_cache to %s\n", (va_space->skip_cache ? "true" : "false"));
+
+    params->rmStatus = ret;
+    return ret;
+}
+#endif
+/**
+ * uvm_get_uvm_mmap_addr() - Return the corresponding addr in vm_area of the mmaped file
+ * va_space - pointer to uvm_va_space_t created for the current user
+ * cpu_addr -??? 
+
+ * When a page fault occurs in shared_memory ptr for addr that is mmaped to 
+ * a file (via UVM_MAP_VMA_RANGE IOCTL in va_space->mmap_array[]), we need
+ * to get the coresponding ptr in vm_arrea of the mmaped file in order to
+ * have access to page cache and all relevant cb for reading the data from
+ * disk. This function returns this addr.
+ */
+struct vm_area_struct *uvm_va_to_cpu_vma(uvm_va_space_t *va_space, NvU64 shared_addr)
+{
+	int i;
+//UCM_DBG("uvm_va_space(%p)->mmap_arr_idx = %d, addr=0x%llx\n", va_space, va_space->mmap_arr_idx, shared_addr);
+	for (i = 0; i < va_space->mmap_arr_idx; i++) {
+		struct uvm_va_mappings_struct *map = &va_space->mmap_array[i];
+		if ((map->start == shared_addr || map->start < shared_addr)  && 
+		     map->end > shared_addr) {
+//			UCM_DBG("found mapping for shared 0x%llx at idx %d. \n", 
+//				shared_addr, i);
+			return map->uvm_vma;
+		}
+//		UCM_DBG("shared_addr 0x%llx not part of uvm va space %p\n", shared_addr, va_space);
+	}
+
+	return NULL;
+}
+
 static NV_STATUS uvm_va_range_add_gpu_va_space_managed(uvm_va_range_t *va_range, uvm_gpu_va_space_t *gpu_va_space)
 {
     uvm_va_block_t *va_block;
@@ -928,6 +1163,7 @@ static NV_STATUS uvm_va_range_split_blocks(uvm_va_range_t *existing, uvm_va_rang
         // mapping code can start looking at new, so new must be ready to go.
         uvm_mutex_lock(&block->lock);
         UVM_ASSERT(block->va_range == existing);
+ WARN_ON(!new);
         block->va_range = new;
         uvm_mutex_unlock(&block->lock);
 

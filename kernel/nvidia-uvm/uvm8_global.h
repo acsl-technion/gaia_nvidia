@@ -214,4 +214,6 @@ static NV_STATUS uvm_global_get_status(void)
 // reset call was made.
 NV_STATUS uvm_global_reset_fatal_error(void);
 
+extern long int pf_counter;
+
 #endif // __UVM8_GLOBAL_H__

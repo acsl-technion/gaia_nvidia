@@ -43,7 +43,7 @@ static NV_STATUS try_peer_access_remote_gpu_memory(uvm_gpu_t *local_gpu, uvm_gpu
     NvU32 i;
 
     // allocate CPU memory
-    status = uvm_mem_alloc_sysmem_and_map_cpu_kernel(MEM_ALLOCATION_SIZE, &sysmem);
+    status = uvm_mem_alloc_sysmem_and_map_cpu_kernel(MEM_ALLOCATION_SIZE, &sysmem, 0);
     TEST_CHECK_GOTO(status == NV_OK, cleanup);
 
     // get CPU address

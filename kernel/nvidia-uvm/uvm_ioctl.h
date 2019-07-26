@@ -967,6 +967,33 @@ typedef struct
 } UVM_PAGEABLE_MEM_ACCESS_ON_GPU_PARAMS;
 
 //
+// uvm_base - is the prt returned by cudaMAllocManaged
+// cpu_base - is the ptr returned by mmap(myfile)
+#define UVM_MAP_VMA_RANGE                                     UVM_IOCTL_BASE(71)
+typedef struct
+{
+	NvU64                   uvm_base                        NV_ALIGN_BYTES(8); // IN
+	NvU64                   cpu_base                        NV_ALIGN_BYTES(8); // IN
+	NV_STATUS               rmStatus;										   // OUT
+} UVM_MAP_VMA_RANGE_PARAMS;
+
+#define UVM_UNMAP_VMA_RANGE                                     UVM_IOCTL_BASE(72)
+typedef struct
+{
+    NvU64                   uvm_base                        NV_ALIGN_BYTES(8); // IN
+    NV_STATUS               rmStatus;                                          // OUT
+} UVM_UNMAP_VMA_RANGE_PARAMS;
+#if 1
+#define UVM_TOUCH_RANGE                                     	UVM_IOCTL_BASE(73)
+typedef struct
+{
+    NvU64                   uvm_base                        NV_ALIGN_BYTES(8); // IN
+    NvU64		    start_addr;			    NV_ALIGN_BYTES(8); // IN
+    NvU64		    length                          NV_ALIGN_BYTES(8); // IN
+    NV_STATUS               rmStatus;                                          // OUT
+} UVM_TOUCH_RANGE_PARAMS;
+#endif
+//
 // Temporary ioctls which should be removed before UVM 8 release
 // Number backwards from 2047 - highest custom ioctl function number
 // windows can handle.

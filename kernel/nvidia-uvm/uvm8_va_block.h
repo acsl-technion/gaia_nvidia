@@ -245,6 +245,8 @@ typedef struct
 
 } uvm_va_block_gpu_state_t;
 
+typedef char page_data_t[PAGE_SIZE];
+
 // TODO: Bug 1766180: Worst-case we could have one of these per system page.
 //       Options:
 //       1) Rely on the OOM killer to prevent the user from trying to do that
@@ -288,6 +290,8 @@ struct uvm_va_block_struct
     // write mode.
     NvU64 start;
     NvU64 end;
+    struct uvm_va_mappings_struct *cpu_map;
+//    NvU64 cpu_mapping_start;
 
     // Per-processor residency bit vector, used for fast lookup of which
     // processors are active in this block.
@@ -342,6 +346,8 @@ struct uvm_va_block_struct
         // being accessed and these mappings are tracked in the GPU state,
         // uvm_va_block_gpu_state_t::cpu_pages_dma_addrs.
         struct page **pages;
+	bool *page_from_cache;
+	page_data_t *pages_diff; //used for holding orig data of the page before gpu made updates
 
         // Per-page mapping bit vectors, one per bit we need to track. These are
         // used for fast traversal of valid mappings in the block. These contain
@@ -474,6 +480,7 @@ static inline void uvm_va_block_retain(uvm_va_block_t *va_block)
     nv_kref_get(&va_block->kref);
 }
 
+static inline NvU64 uvm_va_block_size(uvm_va_block_t *block);
 static inline void uvm_va_block_release(uvm_va_block_t *va_block)
 {
     if (va_block) {
@@ -481,6 +488,11 @@ static inline void uvm_va_block_release(uvm_va_block_t *va_block)
         // releasing the block as it might get destroyed.
         uvm_assert_unlocked_order(UVM_LOCK_ORDER_VA_BLOCK);
         nv_kref_put(&va_block->kref, uvm_va_block_destroy);
+	if (va_block->cpu.page_from_cache) {
+		//UCM_DBG("RESET page_from_cache for block[0x%llx-0x%llx]\n", va_block->start, va_block->end);
+		memset(va_block->cpu.page_from_cache, 0, 
+			uvm_va_block_size(va_block)/PAGE_SIZE * sizeof(va_block->cpu.page_from_cache[0]));
+	}
     }
 }
 
@@ -565,6 +577,7 @@ NV_STATUS uvm_va_block_make_resident_read_duplicate(uvm_va_block_t *va_block,
                                                     const unsigned long *page_mask,
                                                     const unsigned long *prefetch_page_mask,
                                                     uvm_make_resident_cause_t cause);
+
 
 // Creates or upgrades a mapping from the input processor to the given virtual
 // address region. Pages which already have new_prot permissions or higher are
@@ -1534,5 +1547,8 @@ uvm_prot_t uvm_va_block_page_compute_highest_permission(uvm_va_block_t *va_block
                                                                     \
     status;                                                         \
 })
+
+struct uvm_va_mappings_struct *uvm_get_cpu_mapping( uvm_va_space_t *va_space, NvU64 start, NvU64 end);
+NV_STATUS block_evict_pages_from_gpu(uvm_va_block_t *va_block, uvm_gpu_t *gpu);
 
 #endif // __UVM8_VA_BLOCK_H__

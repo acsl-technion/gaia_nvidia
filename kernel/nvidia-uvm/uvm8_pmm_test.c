@@ -469,7 +469,7 @@ static NV_STATUS basic_test(uvm_va_space_t *va_space, uvm_gpu_t *gpu,
     INIT_LIST_HEAD(&test_state.list);
     test_state.va_space = va_space;
     test_state.pmm = &gpu->pmm;
-    MEM_NV_CHECK_RET(uvm_mem_alloc_sysmem_and_map_cpu_kernel(UVM_CHUNK_SIZE_MAX, &test_state.verif_mem), NV_OK);
+    MEM_NV_CHECK_RET(uvm_mem_alloc_sysmem_and_map_cpu_kernel(UVM_CHUNK_SIZE_MAX, &test_state.verif_mem, 0), NV_OK);
     TEST_NV_CHECK_GOTO(uvm_mem_map_gpu_kernel(test_state.verif_mem, gpu), out);
 
     for (test_state.type = first_memory_type; test_state.type <= last_memory_type; test_state.type++) {
@@ -690,7 +690,7 @@ static NV_STATUS split_test(uvm_va_space_t *va_space, uvm_gpu_t *gpu)
     // Check the num_subchunks == 0 case
     TEST_CHECK_RET(uvm_pmm_gpu_get_subchunks(&gpu->pmm, NULL, 0, 0, NULL) == 0);
 
-    MEM_NV_CHECK_RET(uvm_mem_alloc_sysmem_and_map_cpu_kernel(UVM_CHUNK_SIZE_MAX, &verif_mem), NV_OK);
+    MEM_NV_CHECK_RET(uvm_mem_alloc_sysmem_and_map_cpu_kernel(UVM_CHUNK_SIZE_MAX, &verif_mem, 0), NV_OK);
     TEST_NV_CHECK_GOTO(uvm_mem_map_gpu_kernel(verif_mem, gpu), out);
 
     for (type = 0; type < UVM_PMM_GPU_MEMORY_TYPE_COUNT; type++) {

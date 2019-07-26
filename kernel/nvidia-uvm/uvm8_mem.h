@@ -304,7 +304,7 @@ static bool uvm_mem_is_local_vidmem(uvm_mem_t *mem, uvm_gpu_t *gpu)
 }
 
 // Helper for allocating sysmem and mapping it on the CPU
-static NV_STATUS uvm_mem_alloc_sysmem_and_map_cpu_kernel(NvU64 size, uvm_mem_t **mem_out)
+static NV_STATUS uvm_mem_alloc_sysmem_and_map_cpu_kernel(NvU64 size, uvm_mem_t **mem_out, int page_size)
 {
     NV_STATUS status;
     uvm_mem_t *mem;
@@ -312,6 +312,7 @@ static NV_STATUS uvm_mem_alloc_sysmem_and_map_cpu_kernel(NvU64 size, uvm_mem_t *
 
     params.backing_gpu = NULL;
     params.size = size;
+    params.page_size = page_size;
     status = uvm_mem_alloc(&params, &mem);
     if (status != NV_OK)
         return status;

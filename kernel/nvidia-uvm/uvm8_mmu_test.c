@@ -84,11 +84,11 @@ static NV_STATUS test_big_page_swizzling(uvm_gpu_t *gpu)
     TEST_NV_CHECK_GOTO(uvm_mem_map_gpu_kernel(gpu_mem, gpu), done);
     gpu_virtual = uvm_mem_gpu_address_virtual_kernel(gpu_mem, gpu);
 
-    TEST_NV_CHECK_GOTO(uvm_mem_alloc_sysmem_and_map_cpu_kernel(big_page_size, &sys_mem_gold), done);
+    TEST_NV_CHECK_GOTO(uvm_mem_alloc_sysmem_and_map_cpu_kernel(big_page_size, &sys_mem_gold, 0), done);
     TEST_NV_CHECK_GOTO(uvm_mem_map_gpu_kernel(sys_mem_gold, gpu), done);
     sys_gold = uvm_mem_get_cpu_addr_kernel(sys_mem_gold);
 
-    TEST_NV_CHECK_GOTO(uvm_mem_alloc_sysmem_and_map_cpu_kernel(big_page_size, &sys_mem_verif), done);
+    TEST_NV_CHECK_GOTO(uvm_mem_alloc_sysmem_and_map_cpu_kernel(big_page_size, &sys_mem_verif, 0), done);
     TEST_NV_CHECK_GOTO(uvm_mem_map_gpu_kernel(sys_mem_verif, gpu), done);
     sys_verif = uvm_mem_get_cpu_addr_kernel(sys_mem_verif);
 

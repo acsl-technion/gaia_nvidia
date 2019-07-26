@@ -56,7 +56,7 @@ static NV_STATUS check_accessible_from_gpu(uvm_gpu_t *gpu, uvm_mem_t *mem)
     UVM_ASSERT(mem->physical_allocation_size >= verif_size);
     UVM_ASSERT(verif_size >= sizeof(*sys_verif));
 
-    status = uvm_mem_alloc_sysmem_and_map_cpu_kernel(verif_size, &sys_mem);
+    status = uvm_mem_alloc_sysmem_and_map_cpu_kernel(verif_size, &sys_mem, 0);
     TEST_CHECK_GOTO(status == NV_OK, done);
     status = uvm_mem_map_gpu_kernel(sys_mem, gpu);
     TEST_CHECK_GOTO(status == NV_OK, done);

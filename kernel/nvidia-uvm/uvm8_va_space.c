@@ -124,6 +124,12 @@ static NV_STATUS register_gpu_nvlink_peers(uvm_va_space_t *va_space, uvm_gpu_t *
     return NV_OK;
 }
 
+static uvm_va_space_t *uvm_va_space = NULL;
+uvm_va_space_t *get_shared_mem_va_space(void)
+{
+	return uvm_va_space;
+}
+
 NV_STATUS uvm_va_space_create(struct inode *inode, struct file *filp)
 {
     NV_STATUS status;
@@ -133,10 +139,20 @@ NV_STATUS uvm_va_space_create(struct inode *inode, struct file *filp)
     if (!va_space)
         return NV_ERR_NO_MEMORY;
 
+    if (!uvm_va_space) {
+	uvm_va_space = va_space;
+	//UCM_DBG("Saving uvm_va_space %p that is handling shared memory\n", uvm_va_space);
+    } 
+
     uvm_init_rwsem(&va_space->lock, UVM_LOCK_ORDER_VA_SPACE);
     uvm_mutex_init(&va_space->serialize_writers_lock, UVM_LOCK_ORDER_VA_SPACE_SERIALIZE_WRITERS);
     uvm_mutex_init(&va_space->read_acquire_write_release_lock, UVM_LOCK_ORDER_VA_SPACE_READ_ACQUIRE_WRITE_RELEASE_LOCK);
     uvm_range_tree_init(&va_space->va_range_tree);
+
+	memset((void *)va_space->mmap_array, 0, 
+			sizeof(struct uvm_va_mappings_struct) *	UVM_MAX_SUPPORTED_MMAPS);
+	va_space->mmap_arr_idx = 0;
+	va_space->skip_cache = false;
 
     // By default all struct files on the same inode share the same
     // address_space structure (the inode's) across all processes. This means
@@ -449,6 +465,10 @@ void uvm_va_space_destroy(struct file *filp)
     filp->private_data = NULL;
     filp->f_mapping = NULL;
 
+    if (uvm_va_space == va_space) {
+	//UCM_DBG("uvm_va_space is freed. set to null...\n");
+	uvm_va_space = NULL;
+    }
     uvm_kvfree(va_space);
 }
 
